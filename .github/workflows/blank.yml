@@ -1,36 +1,194 @@
-# This is a basic workflow to help you get started with Actions
+name: NOVA — compilar ZIP original do MediaFire
 
-name: CI
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      mediafire_url:
+        description: 'Link da página MediaFire do ZIP original'
+        required: true
+        default: 'https://www.mediafire.com/file/weaxvgcxz82w4fq/NOVA-OMNIVERSE-0_6-HARDENED.zip/file'
+        type: string
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+permissions:
+  contents: write
+
 jobs:
-  # This workflow contains a single job called "build"
   build:
-    # The type of runner that the job will run on
     runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PYTHONUNBUFFERED: '1'
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
-
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
-
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      # Sem actions externas: usa shell e ferramentas já disponíveis no runner.
+      - name: Baixar ZIP original do MediaFire
+        shell: bash
+        env:
+          MEDIAFIRE_URL: ${{ inputs.mediafire_url }}
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          set -Eeuo pipefail
+          mkdir -p "$RUNNER_TEMP/nova/input" "$RUNNER_TEMP/nova/source" "$RUNNER_TEMP/nova/output"
+          PAGE="$RUNNER_TEMP/nova/input/mediafire-page.html"
+          ZIP_FILE="$RUNNER_TEMP/nova/input/NOVA-OMNIVERSE-0_6-HARDENED.zip"
+          python3 - "$MEDIAFIRE_URL" "$PAGE" <<'PYCODE'
+          import sys, urllib.request
+          url, out = sys.argv[1], sys.argv[2]
+          if not url.startswith('https://www.mediafire.com/file/'):
+              raise SystemExit('ERRO: informe a URL completa da página do arquivo MediaFire.')
+          req = urllib.request.Request(url, headers={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36'})
+          try:
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  data = response.read()
+          except Exception as e:
+              raise SystemExit(f'ERRO ao abrir a página MediaFire: {e}')
+          open(out,'wb').write(data)
+          print(f'Página MediaFire obtida ({len(data)} bytes).')
+          PYCODE
+          python3 - "$PAGE" "$ZIP_FILE" <<'PYCODE'
+          import sys, re, html, urllib.request, pathlib
+          page, dest = sys.argv[1], sys.argv[2]
+          text = pathlib.Path(page).read_text(errors='replace')
+          # MediaFire costuma expor o endereço temporário no href do botão downloadButton.
+          m = re.search(r'<a\b(?=[^>]*\bid=["\']downloadButton["\'])([^>]*)>', text, re.I|re.S)
+          if not m:
+              m = re.search(r'<a\b[^>]*href=["\'](https?://download[^"\']+)["\'][^>]*>', text, re.I|re.S)
+              direct = html.unescape(m.group(1)) if m else None
+          else:
+              h = re.search(r'href=["\']([^"\']+)["\']', m.group(1), re.I|re.S)
+              direct = html.unescape(h.group(1)) if h else None
+          if not direct or not direct.startswith('http'):
+              raise SystemExit('ERRO: a página MediaFire não revelou o link de download. Abra o link no navegador e confirme que o arquivo está público; não foi possível extrair um endereço direto válido automaticamente.')
+          print('Link temporário de download encontrado; baixando o ZIP...')
+          req = urllib.request.Request(direct, headers={'User-Agent':'Mozilla/5.0'})
+          try:
+              with urllib.request.urlopen(req, timeout=180) as response, open(dest,'wb') as out:
+                  while True:
+                      chunk=response.read(1024*1024)
+                      if not chunk: break
+                      out.write(chunk)
+          except Exception as e:
+              raise SystemExit(f'ERRO ao baixar o ZIP pelo link temporário: {e}')
+          if pathlib.Path(dest).stat().st_size < 1024:
+              raise SystemExit('ERRO: o download ficou pequeno demais; provavelmente foi baixada uma página de erro, não o ZIP.')
+          print(f'ZIP baixado: {pathlib.Path(dest).stat().st_size} bytes')
+          PYCODE
+          sha256sum "$ZIP_FILE" | tee "$RUNNER_TEMP/nova/output/source-zip.sha256"
+          python3 - "$ZIP_FILE" "$RUNNER_TEMP/nova/source" <<'PYCODE'
+          import pathlib, sys, zipfile
+          archive, destination = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]).resolve()
+          with zipfile.ZipFile(archive) as z:
+              bad = z.testzip()
+              if bad: raise SystemExit(f'ZIP corrompido: {bad}')
+              for item in z.infolist():
+                  target=(destination/item.filename).resolve()
+                  if target != destination and destination not in target.parents:
+                      raise SystemExit(f'Caminho inseguro dentro do ZIP: {item.filename}')
+              z.extractall(destination)
+          print('ZIP original validado e extraído no servidor GitHub Actions.')
+          PYCODE
+          echo 'SOURCE_ARCHIVE=NOVA-OMNIVERSE-0_6-HARDENED.zip (MediaFire)' > "$RUNNER_TEMP/nova/output/build-info.txt"
+
+      - name: Encontrar a raiz real do NOVA
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          SRC="$RUNNER_TEMP/nova/source"
+          ROOT=''
+          FRONTEND="$(find "$SRC" -type f -path '*/tools/nova_frontend.py' -print -quit)"
+          if [[ -n "$FRONTEND" ]]; then
+            candidate="$(dirname "$(dirname "$FRONTEND")")"
+            if [[ -f "$candidate/koch.nim" && -f "$candidate/compiler/nim.nim" \
+               && -f "$candidate/lib/nova/core.nim" ]]; then ROOT="$candidate"; fi
+          fi
+          if [[ -z "$ROOT" ]]; then
+            echo 'ERRO: o ZIP não tem a estrutura esperada do NOVA (koch.nim, compiler/nim.nim, lib/nova/core.nim e tools/nova_frontend.py).'
+            find "$SRC" -maxdepth 3 -type f | head -100
+            exit 3
+          fi
+          echo "NOVA_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "Raiz NOVA identificada: $ROOT"
+          printf 'NOVA raiz: %s\n' "$ROOT" > "$RUNNER_TEMP/nova/output/build-info.txt"
+
+      - name: Instalar compilador Nim de bootstrap
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # O Nim de bootstrap é necessário para compilar o código-fonte do compilador contido no ZIP.
+          curl --fail --silent --show-error --location https://nim-lang.org/choosenim/init.sh -o "$RUNNER_TEMP/choosenim-init.sh"
+          sh "$RUNNER_TEMP/choosenim-init.sh" -y
+          echo "$HOME/.nimble/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.nimble/bin:$PATH"
+          if ! command -v nim >/dev/null 2>&1; then
+            echo 'ERRO: choosenim terminou, mas o executável nim não foi encontrado.'
+            find "$HOME/.nimble" "$HOME/.choosenim" -type f -name nim -perm -111 2>/dev/null | head -20 || true
+            exit 4
+          fi
+          nim --version | tee "$RUNNER_TEMP/nova/output/bootstrap-nim-version.txt"
+
+      - name: Compilar o compilador NOVA/Nim a partir do código-fonte
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$NOVA_ROOT"
+          mkdir -p bin
+          # Compila o bootstrap do compilador diretamente do source, sem depender de csources_v3 ausente no ZIP.
+          nim c -d:release --skipUserCfg --skipParentCfg --noNimblePath \
+            --path:lib --out:bin/nim compiler/nim.nim 2>&1 | tee "$RUNNER_TEMP/nova/output/compiler-bootstrap-build.log"
+          test -x bin/nim
+          bin/nim --version | tee "$RUNNER_TEMP/nova/output/compiled-nim-version.txt"
+
+      - name: Rodar testes e auditoria NOVA
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$NOVA_ROOT"
+          chmod +x bin/nova tools/verify_nova.sh tools/nova_cli_test.sh || true
+          python3 -m compileall -q tools
+          python3 tools/nova_types_test.py
+          python3 tools/nova_capabilities_test.py
+          python3 tools/nova_frontend_regression_test.py
+          python3 tools/nova_catalog_test.py
+          python3 tools/omniverse/test_nova_omniverse.py
+          python3 tools/nova_audit.py . --report "$RUNNER_TEMP/nova/output/nova-audit.json"
+          sh tools/nova_cli_test.sh
+          # Compila e executa os testes do runtime usando o compilador recém-construído.
+          bin/nim c --path:lib --skipUserCfg --skipParentCfg \
+            --out:"$RUNNER_TEMP/nova/nova-core-test" tools/nova_core_test.nim
+          "$RUNNER_TEMP/nova/nova-core-test"
+          bin/nim c --path:lib --skipUserCfg --skipParentCfg \
+            --out:"$RUNNER_TEMP/nova/nova-stdlib-test" tools/nova_stdlib_test.nim
+          "$RUNNER_TEMP/nova/nova-stdlib-test"
+          # Compila o programa Omniverse de demonstração com a runtime NOVA.
+          bin/nim c --path:lib --skipUserCfg --skipParentCfg \
+            --out:"$RUNNER_TEMP/nova/nova-omniverse" omniverse/OMNIVERSE.nim
+          "$RUNNER_TEMP/nova/nova-omniverse" > "$RUNNER_TEMP/nova/output/omniverse-smoke-test.log"
+          echo 'NOVA_SOURCE_TESTS=PASS' >> "$RUNNER_TEMP/nova/output/build-info.txt"
+
+      - name: Empacotar executável e relatórios
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          mkdir -p "$RUNNER_TEMP/nova/output/package"
+          if [[ -n "${NOVA_ROOT:-}" && -d "${NOVA_ROOT:-}" ]]; then
+            [[ -x "$NOVA_ROOT/bin/nim" ]] && cp "$NOVA_ROOT/bin/nim" "$RUNNER_TEMP/nova/output/package/nim-linux-x86_64" || true
+            cp "$NOVA_ROOT/bin/nova" "$RUNNER_TEMP/nova/output/package/nova-cli" 2>/dev/null || true
+            cp "$NOVA_ROOT/README_NOVA.md" "$RUNNER_TEMP/nova/output/package/" 2>/dev/null || true
+            cp "$NOVA_ROOT/omniverse/OMNIVERSE.nova.json" "$RUNNER_TEMP/nova/output/package/" 2>/dev/null || true
+          fi
+          cd "$RUNNER_TEMP/nova/output"
+          tar -czf nova-build-results.tar.gz build-info.txt *.log *.json *.sha256 *version.txt package 2>/dev/null || true
+
+      - name: Disponibilizar logs e resultados
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          OUT="$RUNNER_TEMP/nova/output"
+          mkdir -p "$OUT/package"
+          [[ -f "$OUT/build-info.txt" ]] || printf '%s\n' 'Build falhou antes de concluir.' "Repositorio: $GITHUB_REPOSITORY" "Run: $GITHUB_RUN_ID" > "$OUT/build-info.txt"
+          tar -czf "$OUT/nova-build-results.tar.gz" -C "$OUT" --exclude='nova-build-results.tar.gz' .
+          echo 'Resultados empacotados em nova-build-results.tar.gz'
+          TAG="nova-build-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          gh release create "$TAG" "$OUT/nova-build-results.tar.gz" --repo "$GITHUB_REPOSITORY" --title "NOVA build ${GITHUB_RUN_NUMBER}" --notes "Resultado automático da compilação da versão original NOVA-OMNIVERSE-0_6-HARDENED.zip. Consulte os logs da execução para o resultado detalhado."
+          
